@@ -12,6 +12,7 @@ import {
     type SourceRouteTableEntry,
     StackContext,
     type StackContextCallbacks,
+    TCLinkKeyState,
     TrustCenterKeyRequestPolicy,
 } from "../../src/zigbee-stack/stack-context.js";
 
@@ -486,6 +487,44 @@ describe("StackContext", () => {
             const restoredKey = reloadedContext.getAppLinkKey(device64, reloadedContext.netParams.eui64);
 
             expect(restoredKey).toStrictEqual(appLinkKey);
+        });
+
+        it("persists the unique TC link key secret and per-device key state", async () => {
+            const verified64 = 0x00124b0000aa0001n;
+            const plain64 = 0x00124b0000aa0002n;
+            const seed = Buffer.from("00112233445566778899aabbccddeeff", "hex");
+
+            context.tcLinkKeySeed = Buffer.from(seed);
+            for (const [device64, address16] of [
+                [verified64, 0x1001],
+                [plain64, 0x1002],
+            ] as const) {
+                context.deviceTable.set(device64, {
+                    address16,
+                    capabilities: undefined,
+                    authorized: true,
+                    neighbor: false,
+                    lastTransportedNetworkKeySeq: undefined,
+                    recentLQAs: [],
+                    incomingNWKFrameCounter: undefined,
+                    endDeviceTimeout: undefined,
+                    linkStatusMisses: 0,
+                });
+            }
+            context.deviceTable.get(verified64)!.tcLinkKeyState = TCLinkKeyState.VERIFIED;
+            const uniqueKey = context.getUniqueTCLinkKey(verified64);
+
+            await context.saveState();
+
+            const reloaded = new StackContext(mockStackContextCallbacks, join(saveDir, "zoh.save"), createNetParams());
+
+            await reloaded.loadState();
+
+            expect(reloaded.tcLinkKeySeed).toStrictEqual(seed);
+            expect(reloaded.deviceTable.get(verified64)!.tcLinkKeyState).toStrictEqual(TCLinkKeyState.VERIFIED);
+            expect(reloaded.deviceTable.get(plain64)!.tcLinkKeyState).toBeUndefined();
+            expect(reloaded.getDeviceTCLinkKey(verified64)).toStrictEqual(uniqueKey);
+            expect(reloaded.getDeviceTCLinkKey(plain64)).toBeUndefined();
         });
 
         it("loads state with trailing padding after end marker", async () => {

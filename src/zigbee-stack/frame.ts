@@ -1,7 +1,13 @@
 import { logger } from "../utils/logger.js";
 import { decodeMACFrameControl, decodeMACHeader, decodeMACPayload, MACFrameAddressMode, MACFrameType, ZigbeeMACConsts } from "../zigbee/mac.js";
 import { ZigbeeConsts } from "../zigbee/zigbee.js";
-import { decodeZigbeeAPSFrameControl, decodeZigbeeAPSHeader, decodeZigbeeAPSPayload, ZigbeeAPSFrameType } from "../zigbee/zigbee-aps.js";
+import {
+    decodeZigbeeAPSFrameControl,
+    decodeZigbeeAPSHeader,
+    decodeZigbeeAPSPayload,
+    ZigbeeAPSFrameType,
+    type ZigbeeAPSPayload,
+} from "../zigbee/zigbee-aps.js";
 import {
     decodeZigbeeNWKFrameControl,
     decodeZigbeeNWKHeader,
@@ -14,7 +20,7 @@ import type { APSHandler } from "./aps-handler.js";
 import type { MACHandler } from "./mac-handler.js";
 import type { NWKGPHandler } from "./nwk-gp-handler.js";
 import type { NWKHandler } from "./nwk-handler.js";
-import type { StackContext } from "./stack-context.js";
+import { type StackContext, TCLinkKeyState } from "./stack-context.js";
 
 const NS = "frame-handler";
 
@@ -177,15 +183,39 @@ export async function processFrame(
                     return;
                 }
 
-                const apsPayload = decodeZigbeeAPSPayload(
-                    nwkPayload,
-                    apsHOutOffset,
-                    undefined, // use pre-hashed this.context.netParams.tcKey,
-                    /* nwkHeader.frameControl.extendedSource ? nwkHeader.source64 : this.context.address16ToAddress64.get(nwkHeader.source16!) */
-                    nwkHeader.source64 ?? context.address16ToAddress64.get(nwkHeader.source16!),
-                    apsFCF,
-                    apsHeader,
-                );
+                /* nwkHeader.frameControl.extendedSource ? nwkHeader.source64 : this.context.address16ToAddress64.get(nwkHeader.source16!) */
+                const apsSource64 = nwkHeader.source64 ?? context.address16ToAddress64.get(nwkHeader.source16!);
+                let apsPayload: ZigbeeAPSPayload;
+
+                if (apsFCF.security && apsSource64 !== undefined && context.trustCenterPolicies.uniqueTCLinkKeys) {
+                    // link key based APS security: the device holds either the network's TC link key or its own; try the likely one first
+                    // (state is not authoritative: a device may not have taken the key it was sent, or the TC may have restarted)
+                    const keyState = context.deviceTable.get(apsSource64)?.tcLinkKeyState;
+                    const uniqueKey = context.getUniqueTCLinkKey(apsSource64);
+                    const firstKey = keyState === undefined || keyState === TCLinkKeyState.PROVISIONAL ? undefined : uniqueKey;
+
+                    try {
+                        apsPayload = decodeZigbeeAPSPayload(nwkPayload, apsHOutOffset, firstKey, apsSource64, apsFCF, apsHeader);
+                    } catch {
+                        apsPayload = decodeZigbeeAPSPayload(
+                            nwkPayload,
+                            apsHOutOffset,
+                            firstKey === undefined ? uniqueKey : undefined,
+                            apsSource64,
+                            apsFCF,
+                            apsHeader,
+                        );
+                    }
+                } else {
+                    apsPayload = decodeZigbeeAPSPayload(
+                        nwkPayload,
+                        apsHOutOffset,
+                        undefined, // use pre-hashed this.context.netParams.tcKey,
+                        apsSource64,
+                        apsFCF,
+                        apsHeader,
+                    );
+                }
 
                 // Delegate APS frame processing to APS handler
                 await apsHandler.processFrame(apsPayload, macHeader, nwkHeader, apsHeader, sourceLQA);

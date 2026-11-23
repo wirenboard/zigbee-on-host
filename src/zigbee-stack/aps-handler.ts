@@ -8,7 +8,7 @@ import {
     type MACHeader,
     ZigbeeMACConsts,
 } from "../zigbee/mac.js";
-import { ZigbeeConsts, ZigbeeKeyType, type ZigbeeSecurityHeader, ZigbeeSecurityLevel } from "../zigbee/zigbee.js";
+import { makeKeyedHash, ZigbeeConsts, ZigbeeKeyType, type ZigbeeSecurityHeader, ZigbeeSecurityLevel } from "../zigbee/zigbee.js";
 import {
     encodeZigbeeAPSFrame,
     ZigbeeAPSCommandId,
@@ -22,7 +22,7 @@ import {
 import { encodeZigbeeNWKFrame, ZigbeeNWKConsts, ZigbeeNWKFrameType, type ZigbeeNWKHeader, ZigbeeNWKRouteDiscovery } from "../zigbee/zigbee-nwk.js";
 import type { MACHandler } from "./mac-handler.js";
 import { CONFIG_NWK_MAX_HOPS, type NWKHandler } from "./nwk-handler.js";
-import { ApplicationKeyRequestPolicy, type StackCallbacks, type StackContext, TrustCenterKeyRequestPolicy } from "./stack-context.js";
+import { ApplicationKeyRequestPolicy, type StackCallbacks, type StackContext, TCLinkKeyState, TrustCenterKeyRequestPolicy } from "./stack-context.js";
 
 const NS = "aps-handler";
 
@@ -1161,6 +1161,7 @@ export class APSHandler {
         apsDeliveryMode: ZigbeeAPSDeliveryMode.UNICAST | ZigbeeAPSDeliveryMode.BCAST,
         apsSecurityHeader: ZigbeeSecurityHeader | undefined,
         disableACKRequest = false,
+        apsKey?: Buffer,
     ): Promise<boolean> {
         let nwkSecurityHeader: ZigbeeSecurityHeader | undefined;
 
@@ -1211,6 +1212,11 @@ export class APSHandler {
 
         const macDest16 = nwkDest16 < ZigbeeConsts.BCAST_MIN ? (relayAddresses?.[relayIndex!] ?? nwkDest16) : ZigbeeMACConsts.BCAST_ADDR;
 
+        if (apsKey === undefined && apsSecurityHeader !== undefined && apsSecurityHeader.control.keyId !== ZigbeeKeyType.NWK) {
+            // link key based APS security: the device's own (verified) TC link key if it has one, else the network's TC link key
+            apsKey = this.#context.getDeviceTCLinkKey(nwkDest64 ?? this.#context.address16ToAddress64.get(nwkDest16));
+        }
+
         logger.debug(
             () =>
                 `===> APS CMD[seqNum=(${apsCounter}/${nwkSeqNum}/${macSeqNum}) cmdId=${cmdId} macDst16=${macDest16} nwkDst=${nwkDest16}:${nwkDest64} nwkDiscRte=${nwkDiscoverRoute} nwkSec=${nwkSecurity} apsDlv=${apsDeliveryMode} apsSec=${apsSecurityHeader !== undefined}]`,
@@ -1232,7 +1238,7 @@ export class APSHandler {
             },
             finalPayload,
             apsSecurityHeader,
-            undefined, // use pre-hashed this.context.netParams.tcKey,
+            apsKey, // undefined: use pre-hashed this.context.netParams.tcKey
         );
         const nwkFrame = encodeZigbeeNWKFrame(
             {
@@ -1977,7 +1983,19 @@ export class APSHandler {
                 );
 
                 if (this.#context.trustCenterPolicies.allowTCKeyRequest === TrustCenterKeyRequestPolicy.ALLOWED) {
-                    await this.sendTransportKeyTC(nwkHeader.source16!, this.#context.netParams.tcKey, requester64);
+                    const device = this.#context.deviceTable.get(requester64);
+
+                    if (this.#context.trustCenterPolicies.uniqueTCLinkKeys && device !== undefined) {
+                        // 05-3474-23 #4.7.3.1: the TC SHALL send a new, unique TC link key (the transport is protected by the device's
+                        // current link key: the preconfigured one right after joining). It is used once the device proves it (VERIFY_KEY).
+                        await this.sendTransportKeyTC(nwkHeader.source16!, this.#context.getUniqueTCLinkKey(requester64), requester64);
+
+                        if ((device.tcLinkKeyState ?? TCLinkKeyState.PROVISIONAL) === TCLinkKeyState.PROVISIONAL) {
+                            device.tcLinkKeyState = TCLinkKeyState.UNVERIFIED;
+                        }
+                    } else {
+                        await this.sendTransportKeyTC(nwkHeader.source16!, this.#context.netParams.tcKey, requester64);
+                    }
                 }
                 // TODO TrustCenterKeyRequestPolicy.ONLY_PROVISIONAL
                 //      this.apsDeviceKeyPairSet => find deviceAddress === this.context.deviceTable.get(nwkHeader.source).address64 => check provisional or drop msg
@@ -2208,7 +2226,27 @@ export class APSHandler {
 
             if (keyType === ZigbeeAPSConsts.CMD_KEY_TC_LINK) {
                 // TODO: not valid if operating in distributed network
+                const device = this.#context.deviceTable.get(source);
+
+                if (device !== undefined && (device.tcLinkKeyState ?? TCLinkKeyState.PROVISIONAL) !== TCLinkKeyState.PROVISIONAL) {
+                    // the device was sent its own TC link key: it proves that one, and CONFIRM_KEY is protected with it
+                    const uniqueKey = this.#context.getUniqueTCLinkKey(source);
+
+                    if (makeKeyedHash(uniqueKey, 0x03 /* input byte per spec for VERIFY_KEY */).equals(keyHash)) {
+                        await this.sendConfirmKey(nwkHeader.source16!, 0x00 /* SUCCESS */, keyType, source, uniqueKey);
+
+                        device.tcLinkKeyState = TCLinkKeyState.VERIFIED;
+
+                        return offset;
+                    }
+                }
+
                 const status = this.#context.tcVerifyKeyHash.equals(keyHash) ? 0x00 /* SUCCESS */ : 0xad; /* SECURITY_FAILURE */
+
+                if (status === 0x00 && device !== undefined) {
+                    // the device kept the network's TC link key (absent state = the network's key)
+                    delete device.tcLinkKeyState;
+                }
 
                 await this.sendConfirmKey(nwkHeader.source16!, status, keyType, source);
             } else if (keyType === ZigbeeAPSConsts.CMD_KEY_APP_MASTER) {
@@ -2255,9 +2293,10 @@ export class APSHandler {
      * @param status 1-byte status code indicating the result of the operation. See Table 2.27
      * @param keyType the type of key being verified
      * @param destination64 SHALL be the 64-bit extended address of the source device of the Verify-Key message
+     * @param key the TC link key that was verified, protects this command (default: the device's current TC link key)
      * @returns
      */
-    public async sendConfirmKey(nwkDest16: number, status: number, keyType: number, destination64: bigint): Promise<boolean> {
+    public async sendConfirmKey(nwkDest16: number, status: number, keyType: number, destination64: bigint, key?: Buffer): Promise<boolean> {
         logger.debug(() => `===> APS CONFIRM_KEY[status=${status} type=${keyType} dst64=${destination64}]`, NS);
 
         const finalPayload = Buffer.allocUnsafe(11);
@@ -2287,6 +2326,8 @@ export class APSHandler {
                 // keySeqNum: undefined, only for keyId NWK
                 micLen: 4,
             }, // apsSecurityHeader
+            false, // disableACKRequest
+            key, // the key being confirmed (undefined: the device's current TC link key)
         );
 
         const device = this.#context.deviceTable.get(destination64);

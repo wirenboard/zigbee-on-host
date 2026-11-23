@@ -68,6 +68,7 @@ import {
     type NetworkParameters,
     StackContext,
     type StackContextCallbacks,
+    TCLinkKeyState,
     TrustCenterKeyRequestPolicy,
 } from "../../src/zigbee-stack/stack-context.js";
 import { NETDEF_EXTENDED_PAN_ID, NETDEF_NETWORK_KEY, NETDEF_PAN_ID, NETDEF_TC_KEY } from "../data.js";
@@ -907,7 +908,10 @@ describe("Integration and End-to-End Compliance", () => {
             expect(decoded.apsHeader.securityHeader!.control.keyId).toStrictEqual(ZigbeeKeyType.LOAD);
             expect(decoded.apsPayload.readUInt8(0)).toStrictEqual(ZigbeeAPSCommandId.TRANSPORT_KEY);
             expect(decoded.apsPayload.readUInt8(1)).toStrictEqual(ZigbeeAPSConsts.CMD_KEY_TC_LINK);
-            expect(decoded.apsPayload.subarray(2, 2 + ZigbeeAPSConsts.CMD_KEY_LENGTH)).toStrictEqual(context.netParams.tcKey);
+            // unique to the device (05-3474-23 #4.7.3.1), not the network's (well-known) TC link key
+            expect(decoded.apsPayload.subarray(2, 2 + ZigbeeAPSConsts.CMD_KEY_LENGTH)).toStrictEqual(context.getUniqueTCLinkKey(device64));
+            expect(decoded.apsPayload.subarray(2, 2 + ZigbeeAPSConsts.CMD_KEY_LENGTH)).not.toStrictEqual(context.netParams.tcKey);
+            expect(context.deviceTable.get(device64)!.tcLinkKeyState).toStrictEqual(TCLinkKeyState.UNVERIFIED);
             expect(decoded.apsPayload.readBigUInt64LE(2 + ZigbeeAPSConsts.CMD_KEY_LENGTH)).toStrictEqual(device64);
             expect(context.netParams.tcKeyFrameCounter).toStrictEqual(tcCounterStart + 1);
         });

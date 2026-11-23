@@ -9,7 +9,13 @@
  */
 
 import { ZigbeeConsts } from "../zigbee/zigbee.js";
-import type { AppLinkKeyStoreEntry, DeviceTableEntry, NetworkParameters, SourceRouteTableEntry } from "./stack-context.js";
+import {
+    type AppLinkKeyStoreEntry,
+    type DeviceTableEntry,
+    type NetworkParameters,
+    type SourceRouteTableEntry,
+    TCLinkKeyState,
+} from "./stack-context.js";
 
 /**
  * Parsed device entry with final values ready to use.
@@ -42,6 +48,9 @@ export interface ParsedState extends NetworkParameters {
 
     // Application link keys stored by the Trust Center
     appLinkKeys: AppLinkKeyStoreEntry[];
+
+    // Secret the unique Trust Center link keys are derived from (absent in saves made before unique keys)
+    tcLinkKeySeed?: Buffer;
 }
 
 /**
@@ -66,8 +75,9 @@ export const enum TLVTag {
     TC_KEY = 0x0a,
     TC_KEY_FRAME_COUNTER = 0x0b,
     APP_LINK_KEY_ENTRY = 0x0c,
+    TC_LINK_KEY_SEED = 0x0d,
 
-    // Reserved: 0x0c-0x7f for future network params (115 tags available)
+    // Reserved: 0x0e-0x7f for future network params (114 tags available)
 
     // Device table tags (0x80-0xdf)
     DEVICE_ENTRY = 0x80,
@@ -91,8 +101,9 @@ export const enum DeviceTLVTag {
     DEVICE_AUTHORIZED = 0x04,
     DEVICE_NEIGHBOR = 0x05,
     DEVICE_LAST_NWK_KEY_SEQ = 0x06,
+    DEVICE_TC_LINK_KEY_STATE = 0x07,
 
-    // Reserved: 0x07-0x3f for future device core fields
+    // Reserved: 0x08-0x3f for future device core fields
 
     SOURCE_ROUTE_ENTRY = 0x40,
 
@@ -315,6 +326,9 @@ export function readTLVs(buffer: Buffer, startOffset = 0, endOffset?: number): P
             case TLVTag.APP_LINK_KEY_ENTRY:
                 state.appLinkKeys!.push(readAppLinkKeyTLV(buffer, offset));
                 break;
+            case TLVTag.TC_LINK_KEY_SEED:
+                state.tcLinkKeySeed = buffer.subarray(offset, offset + length);
+                break;
             // Unknown tags ignored for forward compatibility
         }
 
@@ -406,6 +420,9 @@ export function readDeviceTLVs(buffer: Buffer, startOffset: number, endOffset: n
                 break;
             case DeviceTLVTag.DEVICE_LAST_NWK_KEY_SEQ:
                 device.lastTransportedNetworkKeySeq = buffer.readUInt8(offset);
+                break;
+            case DeviceTLVTag.DEVICE_TC_LINK_KEY_STATE:
+                device.tcLinkKeyState = buffer.readUInt8(offset) as TCLinkKeyState;
                 break;
             case DeviceTLVTag.SOURCE_ROUTE_ENTRY:
                 device.sourceRouteEntries!.push(readSourceRouteTLVs(buffer, offset, offset + length));
@@ -579,6 +596,7 @@ export function serializeDeviceEntry(
     neighbor: boolean,
     lastTransportedNetworkKeySeq: number | undefined,
     sourceRouteEntries?: SourceRouteTableEntry[],
+    tcLinkKeyState?: TCLinkKeyState,
 ): Buffer {
     // Estimate size generously
     let estimatedSize = 100; // base fields with TLV overhead
@@ -600,6 +618,10 @@ export function serializeDeviceEntry(
 
     if (lastTransportedNetworkKeySeq !== undefined) {
         offset = writeTLVUInt8(buffer, offset, DeviceTLVTag.DEVICE_LAST_NWK_KEY_SEQ, lastTransportedNetworkKeySeq);
+    }
+
+    if (tcLinkKeyState !== undefined && tcLinkKeyState !== TCLinkKeyState.PROVISIONAL) {
+        offset = writeTLVUInt8(buffer, offset, DeviceTLVTag.DEVICE_TC_LINK_KEY_STATE, tcLinkKeyState);
     }
 
     // Write source route entries (if any)
