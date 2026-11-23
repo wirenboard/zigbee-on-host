@@ -17,11 +17,13 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
     encodeMACCapabilities,
+    encodeMACFrameZigbee,
     MACAssociationStatus,
     type MACCapabilities,
     MACCommandId,
     MACFrameAddressMode,
     MACFrameType,
+    MACFrameVersion,
     type MACHeader,
     ZigbeeMACConsts,
 } from "../../src/zigbee/mac.js";
@@ -40,6 +42,7 @@ import {
     decodeZigbeeAPSFrameControl,
     decodeZigbeeAPSHeader,
     decodeZigbeeAPSPayload,
+    encodeZigbeeAPSFrame,
     ZigbeeAPSCommandId,
     ZigbeeAPSConsts,
     ZigbeeAPSDeliveryMode,
@@ -50,12 +53,14 @@ import {
     decodeZigbeeNWKFrameControl,
     decodeZigbeeNWKHeader,
     decodeZigbeeNWKPayload,
+    encodeZigbeeNWKFrame,
     ZigbeeNWKConsts,
     ZigbeeNWKFrameType,
     type ZigbeeNWKHeader,
     ZigbeeNWKRouteDiscovery,
 } from "../../src/zigbee/zigbee-nwk.js";
 import { APSHandler, type APSHandlerCallbacks } from "../../src/zigbee-stack/aps-handler.js";
+import { processFrame } from "../../src/zigbee-stack/frame.js";
 import { MACHandler, type MACHandlerCallbacks } from "../../src/zigbee-stack/mac-handler.js";
 import { NWKGPHandler, type NWKGPHandlerCallbacks } from "../../src/zigbee-stack/nwk-gp-handler.js";
 import { NWKHandler, type NWKHandlerCallbacks } from "../../src/zigbee-stack/nwk-handler.js";
@@ -65,6 +70,7 @@ import {
     type NetworkParameters,
     StackContext,
     type StackContextCallbacks,
+    TCLinkKeyState,
     TrustCenterKeyRequestPolicy,
 } from "../../src/zigbee-stack/stack-context.js";
 import { NETDEF_EXTENDED_PAN_ID, NETDEF_NETWORK_KEY, NETDEF_PAN_ID, NETDEF_TC_KEY } from "../data.js";
@@ -1358,6 +1364,275 @@ describe("Zigbee 3.0 Security Compliance", () => {
             expect(mockMACHandlerCallbacks.onSendFrame).toHaveBeenCalled();
 
             mockMACHandlerCallbacks.onSendFrame = vi.fn();
+        });
+    });
+
+    /**
+     * Zigbee Spec 05-3474-23 §4.7.3.1: after joining with the preconfigured link key, an R21+ device requests a new Trust Center link key,
+     * which SHALL be unique to it; it proves the key with APS VERIFY_KEY and the TC confirms with APS CONFIRM_KEY secured with that key.
+     */
+    describe("Unique Trust Center Link Keys (Zigbee §4.7.3.1)", () => {
+        function decodeCommandFrameWith(frame: Buffer, apsKey: Buffer | undefined) {
+            const macFrame = decodeMACFramePayload(frame);
+            const macPayload = macFrame.buffer.subarray(macFrame.payloadOffset, macFrame.buffer.length - 2);
+            const [nwkFrameControl, nwkOffset] = decodeZigbeeNWKFrameControl(macPayload, 0);
+            const [nwkHeader, payloadOffset] = decodeZigbeeNWKHeader(macPayload, nwkOffset, nwkFrameControl);
+            const nwkPayload = decodeZigbeeNWKPayload(macPayload, payloadOffset, undefined, context.netParams.eui64, nwkFrameControl, nwkHeader);
+            const [apsFrameControl, apsOffset] = decodeZigbeeAPSFrameControl(nwkPayload, 0);
+            const [apsHeader, apsPayloadOffset] = decodeZigbeeAPSHeader(nwkPayload, apsOffset, apsFrameControl);
+            const apsPayload = decodeZigbeeAPSPayload(nwkPayload, apsPayloadOffset, apsKey, context.netParams.eui64, apsFrameControl, apsHeader);
+
+            return { apsHeader, apsPayload };
+        }
+
+        function makeHeaders(device16: number, device64: bigint, seq: number): [MACHeader, ZigbeeNWKHeader, ZigbeeAPSHeader] {
+            return [
+                {
+                    frameControl: createMACFrameControl(MACFrameType.DATA, MACFrameAddressMode.SHORT, MACFrameAddressMode.SHORT),
+                    sequenceNumber: seq,
+                    destinationPANId: netParams.panId,
+                    destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                    source16: device16,
+                    source64: device64,
+                    commandId: undefined,
+                    fcs: 0,
+                },
+                {
+                    frameControl: {
+                        frameType: ZigbeeNWKFrameType.DATA,
+                        protocolVersion: ZigbeeNWKConsts.VERSION_2007,
+                        discoverRoute: ZigbeeNWKRouteDiscovery.SUPPRESS,
+                        multicast: false,
+                        security: true,
+                        sourceRoute: false,
+                        extendedDestination: false,
+                        extendedSource: true,
+                        endDeviceInitiator: false,
+                    },
+                    destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                    source16: device16,
+                    source64: device64,
+                    radius: 5,
+                    seqNum: seq,
+                },
+                {
+                    frameControl: {
+                        frameType: ZigbeeAPSFrameType.CMD,
+                        deliveryMode: ZigbeeAPSDeliveryMode.UNICAST,
+                        ackFormat: false,
+                        security: true,
+                        ackRequest: false,
+                        extendedHeader: false,
+                    },
+                    counter: seq,
+                },
+            ];
+        }
+
+        async function requestTCLinkKey(device16: number, device64: bigint): Promise<Buffer[]> {
+            const frames: Buffer[] = [];
+            mockMACHandlerCallbacks.onSendFrame = vi.fn((payload: Buffer) => {
+                frames.push(Buffer.from(payload));
+                return Promise.resolve();
+            });
+            const payload = Buffer.from([ZigbeeAPSCommandId.REQUEST_KEY, ZigbeeAPSConsts.CMD_KEY_TC_LINK]);
+
+            await apsHandler.processCommand(payload, ...makeHeaders(device16, device64, 0x30));
+
+            return frames;
+        }
+
+        async function verifyTCLinkKey(device16: number, device64: bigint, hash: Buffer): Promise<Buffer[]> {
+            const frames: Buffer[] = [];
+            mockMACHandlerCallbacks.onSendFrame = vi.fn((payload: Buffer) => {
+                frames.push(Buffer.from(payload));
+                return Promise.resolve();
+            });
+            const payload = Buffer.alloc(1 + 1 + 8 + ZigbeeAPSConsts.CMD_KEY_LENGTH);
+            payload.writeUInt8(ZigbeeAPSCommandId.VERIFY_KEY, 0);
+            payload.writeUInt8(ZigbeeAPSConsts.CMD_KEY_TC_LINK, 1);
+            payload.writeBigUInt64LE(device64, 2);
+            hash.copy(payload, 10);
+
+            await apsHandler.processCommand(payload, ...makeHeaders(device16, device64, 0x40));
+
+            return frames;
+        }
+
+        afterEach(() => {
+            mockMACHandlerCallbacks.onSendFrame = vi.fn();
+        });
+
+        it("derives a stable key per device, different from the network TC link key", () => {
+            const keyA = context.getUniqueTCLinkKey(0x00124b00cc770001n);
+            const keyB = context.getUniqueTCLinkKey(0x00124b00cc770002n);
+
+            expect(keyA.byteLength).toStrictEqual(ZigbeeAPSConsts.CMD_KEY_LENGTH);
+            expect(keyA).not.toStrictEqual(keyB);
+            expect(keyA).not.toStrictEqual(context.netParams.tcKey);
+            expect(context.getUniqueTCLinkKey(0x00124b00cc770001n)).toStrictEqual(keyA);
+        });
+
+        it("transports the unique key under the preconfigured key, confirms it under itself, then uses it", async () => {
+            const device16 = 0x7101;
+            const device64 = 0x00124b00cc770011n;
+            registerNeighborDevice(context, device16, device64);
+            const uniqueKey = context.getUniqueTCLinkKey(device64);
+
+            // request: TRANSPORT_KEY (LOAD key hashed from the preconfigured TC link key, decodable with the defaults)
+            const transport = await requestTCLinkKey(device16, device64);
+            expect(transport).toHaveLength(1);
+            const decodedTransport = decodeCommandFrameWith(transport[0]!, undefined);
+            expect(decodedTransport.apsHeader.securityHeader!.control.keyId).toStrictEqual(ZigbeeKeyType.LOAD);
+            expect(decodedTransport.apsPayload.subarray(2, 2 + ZigbeeAPSConsts.CMD_KEY_LENGTH)).toStrictEqual(uniqueKey);
+            expect(context.deviceTable.get(device64)!.tcLinkKeyState).toStrictEqual(TCLinkKeyState.UNVERIFIED);
+
+            // verify with the unique key's hash: CONFIRM_KEY success, secured with the unique key (not decodable with the defaults)
+            const confirm = await verifyTCLinkKey(device16, device64, makeKeyedHash(uniqueKey, 0x03));
+            expect(confirm).toHaveLength(1);
+            expect(() => decodeCommandFrameWith(confirm[0]!, undefined)).toThrow();
+            const decodedConfirm = decodeCommandFrameWith(confirm[0]!, uniqueKey);
+            expect(decodedConfirm.apsPayload.readUInt8(0)).toStrictEqual(ZigbeeAPSCommandId.CONFIRM_KEY);
+            expect(decodedConfirm.apsPayload.readUInt8(1)).toStrictEqual(0x00);
+            expect(context.deviceTable.get(device64)!.tcLinkKeyState).toStrictEqual(TCLinkKeyState.VERIFIED);
+            expect(context.getDeviceTCLinkKey(device64)).toStrictEqual(uniqueKey);
+
+            // later link-key secured commands to the device (here: network key transport on a TC rejoin) use the unique key
+            const frame = await captureMacFrame(
+                () => apsHandler.sendTransportKeyNWK(device16, context.netParams.networkKey, context.netParams.networkKeySequenceNumber, device64),
+                mockMACHandlerCallbacks,
+            );
+            expect(() => decodeCommandFrameWith(frame.buffer, undefined)).toThrow();
+            const decodedNwkKey = decodeCommandFrameWith(frame.buffer, uniqueKey);
+            expect(decodedNwkKey.apsHeader.securityHeader!.control.keyId).toStrictEqual(ZigbeeKeyType.TRANSPORT);
+            expect(decodedNwkKey.apsPayload.subarray(2, 2 + ZigbeeAPSConsts.CMD_KEY_LENGTH)).toStrictEqual(context.netParams.networkKey);
+        });
+
+        it("keeps the network TC link key for a device that verifies that one instead", async () => {
+            const device16 = 0x7102;
+            const device64 = 0x00124b00cc770012n;
+            registerNeighborDevice(context, device16, device64);
+
+            await requestTCLinkKey(device16, device64);
+            const confirm = await verifyTCLinkKey(device16, device64, context.tcVerifyKeyHash);
+
+            expect(confirm).toHaveLength(1);
+            const decoded = decodeCommandFrameWith(confirm[0]!, undefined);
+            expect(decoded.apsPayload.readUInt8(1)).toStrictEqual(0x00);
+            expect(context.deviceTable.get(device64)!.tcLinkKeyState).toBeUndefined();
+            expect(context.getDeviceTCLinkKey(device64)).toBeUndefined();
+        });
+
+        it("refuses a hash of neither key", async () => {
+            const device16 = 0x7103;
+            const device64 = 0x00124b00cc770013n;
+            registerNeighborDevice(context, device16, device64);
+
+            await requestTCLinkKey(device16, device64);
+            const confirm = await verifyTCLinkKey(device16, device64, Buffer.alloc(ZigbeeAPSConsts.CMD_KEY_LENGTH, 0x5a));
+
+            expect(confirm).toHaveLength(1);
+            expect(decodeCommandFrameWith(confirm[0]!, undefined).apsPayload.readUInt8(1)).toStrictEqual(0xad);
+            expect(context.deviceTable.get(device64)!.tcLinkKeyState).toStrictEqual(TCLinkKeyState.UNVERIFIED);
+        });
+
+        it("sends the network TC link key when unique keys are disabled", async () => {
+            const device16 = 0x7104;
+            const device64 = 0x00124b00cc770014n;
+            registerNeighborDevice(context, device16, device64);
+            context.trustCenterPolicies.uniqueTCLinkKeys = false;
+
+            const transport = await requestTCLinkKey(device16, device64);
+
+            expect(decodeCommandFrameWith(transport[0]!, undefined).apsPayload.subarray(2, 2 + ZigbeeAPSConsts.CMD_KEY_LENGTH)).toStrictEqual(
+                context.netParams.tcKey,
+            );
+            expect(context.deviceTable.get(device64)!.tcLinkKeyState).toBeUndefined();
+        });
+
+        it.each([
+            ["the unique key", TCLinkKeyState.VERIFIED, true],
+            ["the network TC link key", TCLinkKeyState.VERIFIED, false],
+            ["the unique key", undefined, true],
+            ["the network TC link key", undefined, false],
+        ])("decrypts an incoming APS frame secured with %s (device state %s)", async (_name, state, useUnique) => {
+            const device16 = 0x7105;
+            const device64 = 0x00124b00cc770015n;
+            registerNeighborDevice(context, device16, device64);
+            if (state !== undefined) {
+                context.deviceTable.get(device64)!.tcLinkKeyState = state;
+            }
+
+            const apsPayload = Buffer.from([ZigbeeAPSCommandId.REQUEST_KEY, ZigbeeAPSConsts.CMD_KEY_STANDARD_NWK]);
+            const [, , apsHeader] = makeHeaders(device16, device64, 0x51);
+            const apsFrame = encodeZigbeeAPSFrame(
+                apsHeader,
+                apsPayload,
+                {
+                    control: { level: ZigbeeSecurityLevel.NONE, keyId: ZigbeeKeyType.LINK, nonce: true, reqVerifiedFc: false },
+                    frameCounter: 1,
+                    source64: device64,
+                    micLen: 4,
+                },
+                useUnique ? context.getUniqueTCLinkKey(device64) : context.netParams.tcKey,
+            );
+            const nwkFrame = encodeZigbeeNWKFrame(
+                {
+                    frameControl: {
+                        frameType: ZigbeeNWKFrameType.DATA,
+                        protocolVersion: ZigbeeNWKConsts.VERSION_2007,
+                        discoverRoute: ZigbeeNWKRouteDiscovery.SUPPRESS,
+                        multicast: false,
+                        security: true,
+                        sourceRoute: false,
+                        extendedDestination: false,
+                        extendedSource: true,
+                        endDeviceInitiator: false,
+                    },
+                    destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                    source16: device16,
+                    source64: device64,
+                    radius: 5,
+                    seqNum: 0x51,
+                },
+                apsFrame,
+                {
+                    control: { level: ZigbeeSecurityLevel.NONE, keyId: ZigbeeKeyType.NWK, nonce: true, reqVerifiedFc: false },
+                    frameCounter: 1,
+                    source64: device64,
+                    keySeqNum: context.netParams.networkKeySequenceNumber,
+                    micLen: 4,
+                },
+                undefined,
+            );
+            const macFrame = encodeMACFrameZigbee(
+                {
+                    frameControl: {
+                        frameType: MACFrameType.DATA,
+                        securityEnabled: false,
+                        framePending: false,
+                        ackRequest: true,
+                        panIdCompression: true,
+                        seqNumSuppress: false,
+                        iePresent: false,
+                        destAddrMode: MACFrameAddressMode.SHORT,
+                        frameVersion: MACFrameVersion.V2003,
+                        sourceAddrMode: MACFrameAddressMode.SHORT,
+                    },
+                    sequenceNumber: 0x51,
+                    destinationPANId: netParams.panId,
+                    destination16: ZigbeeConsts.COORDINATOR_ADDRESS,
+                    source16: device16,
+                    fcs: 0,
+                },
+                nwkFrame,
+            );
+            const apsProcessSpy = vi.spyOn(apsHandler, "processFrame").mockResolvedValue();
+
+            await processFrame(macFrame, context, macHandler, nwkHandler, nwkGPHandler, apsHandler);
+
+            expect(apsProcessSpy).toHaveBeenCalledTimes(1);
+            expect(apsProcessSpy.mock.calls[0]![0]).toStrictEqual(apsPayload);
         });
     });
 

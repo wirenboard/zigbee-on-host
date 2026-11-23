@@ -419,6 +419,32 @@ export function makeKeyedHash(key: Buffer, inputByte: number): Buffer {
 }
 
 /**
+ * 05-3474-23 R23.1, Annex B.1.4 (Keyed hash for message authentication), with an arbitrary-length message.
+ *
+ * Same construction as `makeKeyedHash` (which is the special case of a 1-byte message):
+ * H((Key XOR opad) || H((Key XOR ipad) || message)), H = AES-128-MMO.
+ * Used by the Trust Center to derive a unique link key per device from a secret and the device's IEEE address.
+ *
+ * @param key 16-byte key
+ * @param message message of any length
+ * @returns 16-byte keyed hash
+ */
+export function makeKeyedHashBytes(key: Buffer, message: Buffer): Buffer {
+    const inner = Buffer.alloc(ZigbeeConsts.SEC_BLOCKSIZE + message.byteLength);
+    const outer = Buffer.alloc(2 * ZigbeeConsts.SEC_BLOCKSIZE);
+
+    for (let i = 0; i < ZigbeeConsts.SEC_KEYSIZE; i++) {
+        inner[i] = key[i] ^ ZigbeeConsts.SEC_IPAD;
+        outer[i] = key[i] ^ ZigbeeConsts.SEC_OPAD;
+    }
+
+    message.copy(inner, ZigbeeConsts.SEC_BLOCKSIZE);
+    aes128MmoHash(inner).copy(outer, ZigbeeConsts.SEC_BLOCKSIZE);
+
+    return aes128MmoHash(outer);
+}
+
+/**
  * 05-3474-23 R23.1, Annex B.1.5 (Key usage definitions)
  *
  * SPEC COMPLIANCE NOTES:

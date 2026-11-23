@@ -1805,7 +1805,8 @@ describe("Zigbee 3.0 Application Support (APS) Layer Compliance", () => {
             expect(apsFrameControl.security).toStrictEqual(true);
             expect(apsPayload.readUInt8(0)).toStrictEqual(ZigbeeAPSCommandId.TRANSPORT_KEY);
             expect(apsPayload.readUInt8(1)).toStrictEqual(ZigbeeAPSConsts.CMD_KEY_TC_LINK);
-            expect(apsPayload.subarray(2, 2 + ZigbeeAPSConsts.CMD_KEY_LENGTH)).toStrictEqual(context.netParams.tcKey);
+            expect(apsPayload.subarray(2, 2 + ZigbeeAPSConsts.CMD_KEY_LENGTH)).toStrictEqual(context.getUniqueTCLinkKey(requester64));
+            expect(apsPayload.subarray(2, 2 + ZigbeeAPSConsts.CMD_KEY_LENGTH)).not.toStrictEqual(context.netParams.tcKey);
             expect(apsPayload.readBigUInt64LE(2 + ZigbeeAPSConsts.CMD_KEY_LENGTH)).toStrictEqual(requester64);
             expect(context.netParams.tcKeyFrameCounter).toStrictEqual(1);
 

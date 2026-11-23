@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { logger } from "../utils/logger.js";
 import { decodeMACCapabilities, encodeMACCapabilities, MACAssociationStatus, type MACCapabilities, type MACHeader } from "../zigbee/mac.js";
@@ -7,6 +8,7 @@ import {
     INSTALL_CODE_VALID_SIZES,
     makeKeyedHash,
     makeKeyedHashByType,
+    makeKeyedHashBytes,
     registerDefaultHashedKeys,
     ZigbeeConsts,
     ZigbeeKeyType,
@@ -70,6 +72,18 @@ export enum TrustCenterKeyRequestPolicy {
     ONLY_PROVISIONAL = 0x02,
 }
 
+/**
+ * 05-3474-23 #4.4.2.2 (KeyAttributes of an apsDeviceKeyPairSet entry), for the Trust Center link key of a device.
+ */
+export const enum TCLinkKeyState {
+    /** The device uses the network's Trust Center link key (the preconfigured, well-known one unless changed) */
+    PROVISIONAL = 0x00,
+    /** The device was sent its own Trust Center link key and has not yet proven it with APS VERIFY_KEY */
+    UNVERIFIED = 0x01,
+    /** The device proved its own Trust Center link key; it is used for all APS security with that device */
+    VERIFIED = 0x02,
+}
+
 export enum ApplicationKeyRequestPolicy {
     DISALLOWED = 0x00,
     /** Any device MAY request an application link key with any device (except the Trust Center) */
@@ -103,6 +117,12 @@ export type TrustCenterPolicies = {
     allowRejoinsWithWellKnownKey: boolean;
     /** This value controls whether devices are allowed to request a Trust Center Link Key after they have joined the network. */
     allowTCKeyRequest: TrustCenterKeyRequestPolicy;
+    /**
+     * Not part of the spec table: whether a Trust Center Link Key request (APS REQUEST_KEY type 4) is answered with a key unique to
+     * the requesting device (derived from a Trust Center secret and the device's IEEE address) instead of the network's TC link key.
+     * R21+ stacks reject the well-known preconfigured key as the result of the request (they leave the network).
+     */
+    uniqueTCLinkKeys: boolean;
     /** This policy indicates whether a node on the network that transmits a ZDO Mgmt_Permit_Join with a significance set to 1 is allowed to effect the local Trust Center’s policies. */
     allowRemoteTCPolicyChange: boolean;
     /** This value determines how the Trust Center SHALL handle attempts to request an application link key with a partner node. */
@@ -146,6 +166,8 @@ export type DeviceTableEntry = {
     neighbor: boolean;
     /** Last network key sequence number successfully transported to the device */
     lastTransportedNetworkKeySeq: number | undefined;
+    /** Which Trust Center link key the device holds: its own (unverified / verified) one, or the network's if absent */
+    tcLinkKeyState?: TCLinkKeyState;
     /**
      * List of recently observed LQAs.
      * Note: this is runtime-only
@@ -389,6 +411,7 @@ export class StackContext {
         installCode: InstallCodePolicy.NOT_REQUIRED,
         allowRejoinsWithWellKnownKey: true,
         allowTCKeyRequest: TrustCenterKeyRequestPolicy.ALLOWED,
+        uniqueTCLinkKeys: true,
         networkKeyUpdatePeriod: 0, // disable
         networkKeyUpdateMethod: NetworkKeyUpdateMethod.BROADCAST,
         allowAppKeyRequest: ApplicationKeyRequestPolicy.DISALLOWED,
@@ -419,6 +442,10 @@ export class StackContext {
     netParams: NetworkParameters;
     /** Pre-computed hash of default TC link key for VERIFY_KEY */
     tcVerifyKeyHash: Buffer = Buffer.alloc(0);
+    /** Secret the unique Trust Center link keys of devices are derived from (persisted; random for a new network) */
+    tcLinkKeySeed: Buffer = randomBytes(ZigbeeConsts.SEC_KEYSIZE);
+    /** Derived unique Trust Center link keys (cache, mapping by IEEE address) */
+    readonly #uniqueTCLinkKeys = new Map<bigint, Buffer>();
     /** MAC association permit flag */
     associationPermit = false;
 
@@ -449,6 +476,39 @@ export class StackContext {
 
     get loaded(): boolean {
         return this.#loaded;
+    }
+
+    /**
+     * The Trust Center link key unique to a device: keyed hash (05-3474-23 Annex B.1.4) of its IEEE address (little endian)
+     * with the Trust Center secret. Derived, not stored: the same device always gets the same key.
+     * @param device64
+     * @returns
+     */
+    getUniqueTCLinkKey(device64: bigint): Buffer {
+        let key = this.#uniqueTCLinkKeys.get(device64);
+
+        if (key === undefined) {
+            const address = Buffer.allocUnsafe(8);
+
+            address.writeBigUInt64LE(device64, 0);
+            key = makeKeyedHashBytes(this.tcLinkKeySeed, address);
+            this.#uniqueTCLinkKeys.set(device64, key);
+        }
+
+        return key;
+    }
+
+    /**
+     * The Trust Center link key APS security with a device uses: its own once verified, the network's TC link key before.
+     * @param device64
+     * @returns undefined for the network's TC link key (pre-hashed keys are used), else the device's own key
+     */
+    getDeviceTCLinkKey(device64: bigint | undefined): Buffer | undefined {
+        if (device64 === undefined || this.deviceTable.get(device64)?.tcLinkKeyState !== TCLinkKeyState.VERIFIED) {
+            return undefined;
+        }
+
+        return this.getUniqueTCLinkKey(device64);
     }
 
     // #endregion
@@ -1061,6 +1121,7 @@ export class StackContext {
             TLVTag.TC_KEY_FRAME_COUNTER,
             this.netParams.tcKeyFrameCounter + CONFIG_SAVE_FRAME_COUNTER_JUMP_OFFSET,
         );
+        offset = writeTLV(state, offset, TLVTag.TC_LINK_KEY_SEED, this.tcLinkKeySeed);
 
         // device table (count is implicit in number of DEVICE_ENTRY tags)
         for (const [device64, device] of this.deviceTable) {
@@ -1073,6 +1134,7 @@ export class StackContext {
                 device.neighbor,
                 device.lastTransportedNetworkKeySeq,
                 sourceRouteEntries,
+                device.tcLinkKeyState,
             );
             offset = writeTLV(state, offset, TLVTag.DEVICE_ENTRY, deviceEntry);
         }
@@ -1162,12 +1224,18 @@ export class StackContext {
             this.netParams.tcKey = state.tcKey;
             this.netParams.tcKeyFrameCounter = state.tcKeyFrameCounter;
 
+            if (state.tcLinkKeySeed?.byteLength === ZigbeeConsts.SEC_KEYSIZE) {
+                this.tcLinkKeySeed = Buffer.from(state.tcLinkKeySeed);
+            }
+            // else: save from before unique TC link keys, keep the new random seed (no device holds a derived key yet)
+
             // Device entries already parsed with all nested source routes
             logger.debug(() => `Current save devices: ${state.deviceEntries.length}`, NS);
 
             for (const device of state.deviceEntries) {
                 // Device values already parsed - just destructure
-                const { address64, address16, capabilities, authorized, neighbor, sourceRouteEntries, lastTransportedNetworkKeySeq } = device;
+                const { address64, address16, capabilities, authorized, neighbor, sourceRouteEntries, lastTransportedNetworkKeySeq, tcLinkKeyState } =
+                    device;
                 const decodedCap = capabilities !== 0 ? decodeMACCapabilities(capabilities) : undefined;
 
                 this.deviceTable.set(address64, {
@@ -1176,6 +1244,7 @@ export class StackContext {
                     authorized,
                     neighbor,
                     lastTransportedNetworkKeySeq,
+                    ...(tcLinkKeyState !== undefined && tcLinkKeyState !== TCLinkKeyState.PROVISIONAL ? { tcLinkKeyState } : {}),
                     recentLQAs: [],
                     incomingNWKFrameCounter: undefined, // TODO: record this (should persist across reboots)
                     endDeviceTimeout: undefined,
